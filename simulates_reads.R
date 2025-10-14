@@ -1,4 +1,4 @@
-
+# Adding comments ver.2.
 rm(list=ls())
 setwd("C:\Users\IrIs_\Documents\GitHub\S610-Toy-Repo")
 
