@@ -1,0 +1,190 @@
+---
+title: "S610 Final Project"
+author: "Junying Tong"
+date: "2025-12-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+
+options("digits" = 4)
+# ---- WORKING DIRECTORY SET UP ----
+base_path <- "C:/Users/IrIs_/iCloudDrive/Desktop/IUB/2025 Fall/S610 Intro to Statistical Computing/Final Project"
+
+path_in  <- file.path(base_path, "raw_data")
+path_out <- file.path(base_path, "processed_data")
+
+# ---- LOADING LIBRARIES ----
+if(!require(pacman)){install.packages("pacman")}
+
+p_load(MASS, data.table, ggplot2)
+```
+
+## Introduction to the Problem
+
+- The purpose of this project: Evaluate the impacts of several meteorological parameters on the count of prescribed fire (Rx) occurrence. Through the *forward stepwise selection* approach:
+    - first, find the "best" combination of parameters to estimate the number of Rx; 
+    - second, explore the post-selection inference (how does this approach affect the validity of the p-values and confidence intervals).
+
+- Data sources: 
+    - Fire weather: ERA5 Reanalysis (https://www.ecmwf.int/en/forecasts/dataset/ecmwf-reanalysis-v5)
+    - Fire Activity in the U.S.: The Environmental Protection Agency, Beidler, Pouliout, and Foley, 2024. 
+
+- Workflow:
+    - Create a custom forward-selection function manually.
+    - Apply the function to the fire–weather dataset to identify the “best” model.
+    - Use simulation to test whether post-selection inference behaves as theory predicts.
+
+- Motivate the design choice and functions:
+    - The manually-written selection function provides full transparency in how variables are chosen.
+    - The simulation under a null assumption isolates the effect of model selection and is useful in experimentation with known expectations of the results.
+    - The selection frequency and conditional type I error are stored and visualized to verify the expected post-selection behavior of the model.
+
+- Evidence provided that the code does what it should:
+    - Post-selection p-values show inflated type I error, confirming the expected failure of standard inference.
+    - In simulation, stepwise selection frequently chooses variables even when the true effect is zero.
+
+### Problem Setup: Clean the Raw Data and Define the Regressions.
+
+```{r cars}
+## Read in the fire and weather conditions data.
+df <- read.csv(file.path(path_in, "Fire_weather_daily_county_data.csv"))
+df <- as.data.frame(df)
+
+## Independent variables: daily county-level average weather parameters.
+predictors <- grep("^mean_", names(df), value = TRUE) 
+predictors # 9 variables in total
+
+## Define the null and full regression equations.
+model_null <- n_fires ~ 1
+model_full <- as.formula(
+  paste("n_fires ~", paste(grep("^mean_", names(df), value = TRUE), collapse = " + "))
+)
+```
+
+
+### Forward Stepwise Selection Using AIC as the Selection on the Observed Data.
+
+```{r}
+## Starts from the null model and adds one predictor at a time,
+#  keeping any addition that lowers AIC, until no further improvement.
+forward_select_lm <- function(df, response, candidates) {
+  data <- as.data.frame(df)
+  in_model   <- character(0)
+  best_model <- lm(as.formula(paste(response, "~ 1")), data = data)  # intercept-only model
+  best_aic   <- AIC(best_model)
+
+  repeat {
+    remaining <- setdiff(candidates, in_model) # predictors that are not yet added
+    if (length(remaining) == 0) break
+
+    aic_vec <- numeric(length(remaining))  # add a placeholder for AIC for adding each remaining candidates.
+    for (j in seq_along(remaining)) {
+      vars <- c(in_model, remaining[j])
+      form <- as.formula(paste(response, "~", paste(vars, collapse = " + ")))
+      fit  <- lm(form, data = data)
+      aic_vec[j] <- AIC(fit)
+    }
+
+    j_best   <- which.min(aic_vec) # selects the best predictor that has the lowest AIC
+    new_aic  <- aic_vec[j_best]
+    
+    if (new_aic >= best_aic) break # stop if no AIC improvement
+
+    # update the current "best model" and the predictor combo.
+    in_model <- c(in_model, remaining[j_best])
+    best_aic <- new_aic
+    best_model <- lm(as.formula(paste(response, "~", paste(in_model, collapse = " + "))),data = data)
+  }
+
+  best_model
+}
+
+## Call the loop
+fit_selected <- forward_select_lm(df, "n_fires", predictors)
+summary(fit_selected)
+```
+
+
+### Simulation Set-up: Imposing a Known "True" Data Generating Process (DGP).
+
+```{r}
+setDT(df)
+X <- as.matrix(df[, ..predictors])  # create a matrix composed of elements in predictors (weather conditions)
+#beta_true <- rep(0, length(predictors)) # imposing zeros as the true coefficients for all predictors
+#names(beta_true) <- predictors
+
+## Repeat 500 times and measure the “post-selection” type I error
+run_simulation <- function(R = 500, sigma_true = 1) {   # SE of error for simulated outcomes
+  n <- nrow(df)
+  selected <- logical(R)
+  pvals <- rep(NA_real_, R)
+  beta_hat <- rep(NA_real_, R)  # store estimated coefficient when selected
+
+  for (i in seq_len(R)) {
+    ## 1. simulate outcome under the "null effects" assumption
+    # generate n_fires under the null
+    # imposing zeros as the true coefficients for all predictors
+    epsilon <- rnorm(n, mean = 0, sd = sigma_true)  
+    data_sim <- as.data.frame(df)
+    data_sim$n_fires <- epsilon  # the dependent variable becomes pure noise.
+
+    ## 2. run forward stepwise selection
+    fwd_fit <- forward_select_lm(data_sim, "n_fires", predictors)
+
+    ## 3. extract p-value for mean_t2m_F if selected
+    summary_stats <- summary(fwd_fit)
+    row_names <- rownames(summary_stats$coef)
+
+    if ("mean_t2m_F" %in% row_names) {  # take "mean 2m-temperature Fahrenheit" as an example
+      pvals[i] <- summary_stats$coef["mean_t2m_F", "Pr(>|t|)"]
+      beta_hat[i] <- summary_stats$coef["mean_t2m_F", "Estimate"]
+      selected[i] <- TRUE
+    } else {
+      selected[i] <- FALSE
+      pvals[i] <- NA_real_
+      beta_hat[i] <- NA_real_
+    }
+  }
+
+  list(selected = selected, pvals = pvals, beta_hat = beta_hat) # store the selection status/p-value/coefficient
+}
+
+## Call the loop
+set.seed(123)
+sim_results <- run_simulation(R = 500, sigma_true = 1)
+
+## How often is mean_t2m_F selected for the best model?
+mean(sim_results$selected)
+
+## Conditional on being selected, how often is p < 0.05? (type I error)
+mean(sim_results$pvals[sim_results$selected] < 0.05, na.rm = TRUE)
+
+## This means: Among the simulations where mean_t2m_F is selected, its p-value is < 0.05 about 56% of the time, even though the true effect is 0.
+```
+
+
+### Plot the Density of Simulated Coefficients.
+
+```{r, warning=FALSE}
+beta_selected <- sim_results$beta_hat[sim_results$selected]
+beta_df <- data.frame(beta_selected)
+
+ggplot(beta_df, aes(x = beta_selected)) +
+  geom_histogram(aes(y = ..density..),
+                 bins = 25,
+                 color = "white",
+                 fill  = "forestgreen") +
+  # add a smooth density curve
+  geom_density(linewidth = 1) +
+  # true coefficient = 0
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title    = "Post-selection distribution of estimated coefficient",
+    subtitle = "mean_t2m_F, conditional on being selected",
+    x        = "Coefficient Estimate",
+    y        = "Density"
+  ) +
+  theme_minimal(base_size = 13)
+```
